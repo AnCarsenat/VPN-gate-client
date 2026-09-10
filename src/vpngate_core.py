@@ -2,6 +2,7 @@
 import requests
 import base64
 import gzip
+import shutil
 import subprocess
 import tempfile
 import os
@@ -158,6 +159,12 @@ def load_cached_servers():
         print(f"Ignoring unreadable cache: {error}")
         return [], None
 
+def _connection_exists(name):
+    res = subprocess.run(["nmcli", "-t", "-f", "NAME", "connection", "show"],
+                         capture_output=True, text=True)
+    return name in res.stdout.splitlines()
+
+
 def is_active():
     res = subprocess.run(["nmcli", "-t", "-f", "NAME,STATE", "connection", "show", "--active"], capture_output=True, text=True)
     return CONNECTION_NAME in res.stdout
@@ -225,17 +232,27 @@ def connect_vpn(server, force_proto=None):
         config_data = re.sub(r"^proto tcp", ";proto tcp", config_data, flags=re.MULTILINE | re.IGNORECASE)
         config_data = re.sub(r"^[; \t]*proto udp", "proto udp", config_data, flags=re.MULTILINE | re.IGNORECASE)
 
-    # The config embeds a client certificate and its RSA private key. mkstemp
-    # gives an unpredictable name with 0600, rather than a fixed world-readable
-    # path in /tmp that another user could read or pre-empt with a symlink.
-    fd, temp_ovpn = tempfile.mkstemp(prefix="vpngate-", suffix=".ovpn")
+    # The file name is load-bearing: `nmcli connection import` takes the
+    # connection id from the basename, so this has to be exactly
+    # "<CONNECTION_NAME>.ovpn" or every later command that refers to
+    # CONNECTION_NAME - up, delete, is_active - silently addresses nothing.
+    #
+    # The config embeds a client certificate and its RSA private key, so the
+    # file cannot simply live at a fixed path in /tmp where another user could
+    # read it or pre-empt it with a symlink. A private directory gives both:
+    # mkdtemp is 0700, and the name inside it is ours to choose.
+    temp_dir = tempfile.mkdtemp(prefix="vpngate-")
+    temp_ovpn = os.path.join(temp_dir, f"{CONNECTION_NAME}.ovpn")
     try:
-        with os.fdopen(fd, "w") as f:
+        with open(os.open(temp_ovpn, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600),
+                  "w", closefd=True) as f:
             f.write(config_data)
         return _import_and_connect(server, config_data, temp_ovpn)
     finally:
-        if os.path.exists(temp_ovpn):
-            os.remove(temp_ovpn)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+IMPORT_UUID_RE = re.compile(r"\(([0-9a-fA-F-]{36})\)")
 
 
 def _import_and_connect(server, config_data, temp_ovpn):
@@ -246,30 +263,44 @@ def _import_and_connect(server, config_data, temp_ovpn):
     if import_res.returncode != 0:
         return False, f"Failed to import: {import_res.stderr}"
 
+    # Belt and braces for the coupling above. nmcli reports the connection it
+    # created as "Connection 'name' (uuid) successfully added."; addressing it
+    # by uuid from here on means a mismatched name can neither strand the
+    # connect nor leave an orphan holding the private key.
+    uuid_match = IMPORT_UUID_RE.search(import_res.stdout)
+    handle = uuid_match.group(1) if uuid_match else CONNECTION_NAME
+
+    if uuid_match:
+        subprocess.run(["nmcli", "connection", "modify", handle,
+                        "connection.id", CONNECTION_NAME], capture_output=True)
+    elif not _connection_exists(CONNECTION_NAME):
+        return False, ("Imported connection could not be identified; "
+                       "refusing to continue.")
+
     remote_match = re.search(r"^remote\s+([\d\.]+)\s+(\d+)", config_data, re.MULTILINE)
     remote_ip = remote_match.group(1) if remote_match else server['IP']
     remote_port = remote_match.group(2) if remote_match else "443"
     
-    subprocess.run(["nmcli", "connection", "modify", CONNECTION_NAME, 
+    subprocess.run(["nmcli", "connection", "modify", handle,
                     "vpn.user-name", "vpn",
                     "vpn.secrets", "password=vpn",
                     "+vpn.data", f"auth=SHA1, cipher=AES-128-CBC, data-ciphers=AES-256-GCM:AES-128-GCM:AES-128-CBC, data-ciphers-fallback=AES-128-CBC, connection-type=password, remote={remote_ip}, port={remote_port}"], capture_output=True)
 
     try:
-        up_res = subprocess.run(["timeout", "10s", "nmcli", "connection", "up", CONNECTION_NAME], capture_output=True, text=True)
+        up_res = subprocess.run(["timeout", "10s", "nmcli", "connection", "up", handle], capture_output=True, text=True)
         
         if up_res.returncode == 0:
             with open(PID_FILE, "w") as f:
                 f.write(str(os.getpid()))
             return True, "Successfully connected!"
         elif up_res.returncode == 124:
-            subprocess.run(["nmcli", "connection", "delete", CONNECTION_NAME], capture_output=True)
+            subprocess.run(["nmcli", "connection", "delete", handle], capture_output=True)
             return False, "Connection timed out (>10s)."
         else:
-            subprocess.run(["nmcli", "connection", "delete", CONNECTION_NAME], capture_output=True)
+            subprocess.run(["nmcli", "connection", "delete", handle], capture_output=True)
             return False, f"Connection failed: {up_res.stderr}"
     except Exception as e:
-        subprocess.run(["nmcli", "connection", "delete", CONNECTION_NAME], capture_output=True)
+        subprocess.run(["nmcli", "connection", "delete", handle], capture_output=True)
         return False, str(e)
 
 def disconnect_vpn():
