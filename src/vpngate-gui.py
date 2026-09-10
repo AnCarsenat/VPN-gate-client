@@ -1,27 +1,40 @@
 #!/usr/bin/env python3
-import sys
-import subprocess
 import os
+import sys
+
+# Resolve the real directory of this script so the sibling core module and the
+# assets/ tree are found whether the script is run from the repo, from an
+# installed copy, or through the /usr/bin symlink.
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+REQUIREMENTS = os.path.join(SCRIPT_DIR, "assets", "requirements.txt")
+REQUIRED_MODULES = {"requests": "python-requests", "PyQt6": "python-pyqt6"}
+
 
 def check_dependencies():
-    """Check if required packages are installed, if not, try to install from requirements.txt"""
+    """Exit with install instructions if a required third-party module is missing."""
+    missing = [(module, pkg) for module, pkg in REQUIRED_MODULES.items()
+               if not _importable(module)]
+    if not missing:
+        return
+
+    print("Missing dependencies: " + ", ".join(module for module, _ in missing))
+    print("On Arch Linux:")
+    print("    sudo pacman -S " + " ".join(pkg for _, pkg in missing))
+    print("Elsewhere, inside a virtualenv:")
+    print("    pip install -r " + REQUIREMENTS)
+    sys.exit(1)
+
+
+def _importable(module):
     try:
-        import requests
-        import PyQt6
+        __import__(module)
     except ImportError:
-        print("Required dependencies not found. Installing from requirements.txt...")
-        script_dir = os.path.dirname(os.path.realpath(__file__))
-        req_path = os.path.join(script_dir, "requirements.txt")
-        if os.path.exists(req_path):
-            try:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", req_path])
-                print("Dependencies installed successfully.")
-            except subprocess.CalledProcessError:
-                print("Failed to install dependencies. Please run 'pip install -r requirements.txt' manually.")
-                sys.exit(1)
-        else:
-            print("requirements.txt not found. Please install dependencies manually.")
-            sys.exit(1)
+        return False
+    return True
+
 
 check_dependencies()
 
@@ -32,14 +45,26 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QIcon, QAction, QPalette, QColor
 
-# Ensure we can import the core logic
-script_dir = os.path.dirname(os.path.realpath(__file__))
-sys.path.append(script_dir)
 import vpngate_core as vpncore
 
-ICON_64 = os.path.join(script_dir, "64.png")
-ICON_256 = os.path.join(script_dir, "256.png")
-ICON_32 = os.path.join(script_dir, "32.png")
+ICON_DIR = os.path.join(SCRIPT_DIR, "assets", "icons")
+ICON_256 = os.path.join(ICON_DIR, "256.png")
+ICON_64 = os.path.join(ICON_DIR, "64.png")
+ICON_32 = os.path.join(ICON_DIR, "32.png")
+
+
+def load_app_icon():
+    """Prefer the installed hicolor theme icon, fall back to the bundled PNGs."""
+    icon = QIcon.fromTheme("vpngate-gui")
+    if not icon.isNull():
+        return icon
+
+    for path in (ICON_256, ICON_64, ICON_32):
+        if os.path.exists(path):
+            return QIcon(path)
+
+    return QIcon.fromTheme("network-vpn")
+
 
 class Worker(QThread):
     finished = pyqtSignal(bool, str)
@@ -162,19 +187,7 @@ class VPNWindow(QMainWindow):
         # System Tray
         self.tray_icon = QSystemTrayIcon(self)
         
-        # Check the highest resolution PNG first
-        print(f"Looking for icon at: {ICON_256}")
-        
-        if os.path.exists(ICON_256):
-            icon = QIcon(ICON_256)
-        elif os.path.exists(ICON_64):
-            icon = QIcon(ICON_64)
-        else:
-            icon = QIcon()
-
-        if icon.isNull():
-            icon = QIcon.fromTheme("network-vpn")
-            print("Warning: Custom PNGs not found. Using fallback system icon.")
+        icon = load_app_icon()
             
         self.tray_icon.setIcon(icon)
         self.setWindowIcon(icon)
