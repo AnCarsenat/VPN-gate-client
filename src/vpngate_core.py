@@ -3,6 +3,7 @@ import requests
 import base64
 import gzip
 import subprocess
+import tempfile
 import os
 import re
 import time
@@ -115,27 +116,46 @@ def get_servers():
 
 
 def save_cache(lines):
+    """Write the cache atomically.
+
+    A half-written file is worse than no file: it is read back at startup, so
+    a crash or a full disk mid-write would break every subsequent launch.
+    """
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
-        with gzip.open(CACHE_FILE, "wt", encoding="utf-8") as handle:
-            handle.write("\n".join(lines))
+        fd, temp_path = tempfile.mkstemp(dir=CACHE_DIR, suffix=".tmp")
+        try:
+            with gzip.open(os.fdopen(fd, "wb"), "wt", encoding="utf-8") as handle:
+                handle.write("\n".join(lines))
+            os.replace(temp_path, CACHE_FILE)
+        except BaseException:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise
     except OSError as error:
         print(f"Could not write cache: {error}")
 
 
-def load_cached_servers(max_age=86400):
+def load_cached_servers():
     """Last fetch, for showing something instantly while the refresh runs.
 
     Returns (servers, age_in_seconds), or ([], None) when there is no usable
-    cache. Stale entries are still returned if they parse - the caller shows
-    them as stale rather than showing an empty window.
+    cache. However old the cache is, it is still returned: the caller labels it
+    with its age, which beats showing an empty window.
+
+    Every failure has to end up as ([], None). This runs during startup, so
+    anything raised here stops the app from opening at all. A truncated gzip
+    raises EOFError, which is not an OSError.
     """
     try:
         age = time.time() - os.path.getmtime(CACHE_FILE)
         with gzip.open(CACHE_FILE, "rt", encoding="utf-8") as handle:
             servers = parse_lines(handle.read().splitlines())
         return servers, age
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        return [], None            # first run, nothing cached yet
+    except Exception as error:
+        print(f"Ignoring unreadable cache: {error}")
         return [], None
 
 def is_active():
@@ -205,14 +225,24 @@ def connect_vpn(server, force_proto=None):
         config_data = re.sub(r"^proto tcp", ";proto tcp", config_data, flags=re.MULTILINE | re.IGNORECASE)
         config_data = re.sub(r"^[; \t]*proto udp", "proto udp", config_data, flags=re.MULTILINE | re.IGNORECASE)
 
-    temp_ovpn = "/tmp/vpngate-active.ovpn"
-    with open(temp_ovpn, 'w') as f:
-        f.write(config_data)
-    
+    # The config embeds a client certificate and its RSA private key. mkstemp
+    # gives an unpredictable name with 0600, rather than a fixed world-readable
+    # path in /tmp that another user could read or pre-empt with a symlink.
+    fd, temp_ovpn = tempfile.mkstemp(prefix="vpngate-", suffix=".ovpn")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(config_data)
+        return _import_and_connect(server, config_data, temp_ovpn)
+    finally:
+        if os.path.exists(temp_ovpn):
+            os.remove(temp_ovpn)
+
+
+def _import_and_connect(server, config_data, temp_ovpn):
     subprocess.run(["nmcli", "connection", "delete", CONNECTION_NAME], capture_output=True)
-    
+
     import_res = subprocess.run(["nmcli", "connection", "import", "type", "openvpn", "file", temp_ovpn], capture_output=True, text=True)
-    
+
     if import_res.returncode != 0:
         return False, f"Failed to import: {import_res.stderr}"
 
@@ -241,9 +271,6 @@ def connect_vpn(server, force_proto=None):
     except Exception as e:
         subprocess.run(["nmcli", "connection", "delete", CONNECTION_NAME], capture_output=True)
         return False, str(e)
-    finally:
-        if os.path.exists(temp_ovpn):
-            os.remove(temp_ovpn)
 
 def disconnect_vpn():
     if not is_active():

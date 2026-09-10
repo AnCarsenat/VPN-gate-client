@@ -75,7 +75,13 @@ if __name__ == "__main__":
         elif proto_pref == "tcp" and s['has_tcp']: filtered.append(s)
         elif proto_pref == "all": filtered.append(s)
     
-    filtered.sort(key=lambda x: int(x['Score']), reverse=True)
+    def score(server):
+        try:
+            return int(server.get('Score', 0))
+        except (TypeError, ValueError):
+            return 0
+
+    filtered.sort(key=score, reverse=True)
     
     print(f"{'Idx':<4} | {'Proto':<5} | {'Country':<15} | {'IP':<15} | {'Score':<10} | {'Ping':<5}")
     print("-" * 75)

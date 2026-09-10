@@ -909,6 +909,14 @@ class VPNWindow(QMainWindow):
         if self.is_quitting:
             event.accept()
             return
+
+        # With no tray to restore from, hiding would leave the app running with
+        # no window and no way to reach it - Ctrl+Q needs a focused window.
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            event.ignore()
+            self.quit_app()
+            return
+
         self.hide()
         event.ignore()
 
@@ -947,12 +955,15 @@ class VPNWindow(QMainWindow):
         return self.vpn_active
 
     def tick(self):
-        if self.is_busy or self.is_quitting or self.is_fetching:
+        if self.is_busy or self.is_quitting:
             return
+
+        # Keep watching the VPN even mid-refresh: a fetch can take seconds, and
+        # the status line should not go stale if the tunnel drops during one.
         was_active = self.vpn_active
         if self.refresh_active_state() != was_active:
             self.update_ui_state()
-        if self.vpn_active and not self.stats_worker.isRunning():
+        if self.vpn_active and not self.is_fetching and not self.stats_worker.isRunning():
             self.stats_worker.start()
 
     def update_ui_state(self, is_busy=None):
@@ -1225,18 +1236,28 @@ class VPNWindow(QMainWindow):
         proto = "tcp" if checked is not None and checked.data() == "tcp" else None
         self.status_label.setText(f"Status: Connecting to {server['IP']} (10s timeout)...")
         self.update_ui_state(is_busy=True)
-        self.worker = Worker("connect", server, proto)
-        self.worker.finished.connect(self.on_action_finished)
-        self.worker.start()
+        self.worker = self.start_worker(Worker("connect", server, proto))
 
     def start_disconnect(self, *_args):
         if self.is_busy:
             return
         self.status_label.setText("Status: Disconnecting...")
         self.update_ui_state(is_busy=True)
-        self.worker = Worker("disconnect")
-        self.worker.finished.connect(self.on_action_finished)
-        self.worker.start()
+        self.worker = self.start_worker(Worker("disconnect"))
+
+    def start_worker(self, worker):
+        """Hand a worker to Qt for ownership before starting it.
+
+        self.worker is rebound on the next action. If the previous QThread were
+        owned only by that name, rebinding could drop its last reference while
+        it is still running, which aborts the process rather than raising.
+        Parenting keeps it alive until Qt deletes it after it finishes.
+        """
+        worker.setParent(self)
+        worker.finished.connect(self.on_action_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+        return worker
 
     def on_action_finished(self, success, message):
         self.is_busy = False
