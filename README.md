@@ -74,8 +74,18 @@ clicked cell, copy any single field, or copy the whole row. **Double-click**
 connects. Favourites are marked ★ and persist to
 `~/.config/vpn-gate-client/favourites.json`.
 
-**Shortcuts:** `Ctrl+R` refresh, `Ctrl+F` search, `Ctrl+K` connect,
-`Ctrl+D` disconnect, `Ctrl+Q` quit.
+**Technical details.** `Ctrl+I`, the Connection menu, or the row menu opens a
+dialog with every field the API reports — the raw Score behind the rating, raw
+ping, speed in bps, uptime, total traffic and users, log policy, operator. It
+can copy the whole table or the server's OpenVPN config.
+
+**Shortcuts:** `Ctrl+R` refresh, `Ctrl+F` search, `Ctrl+I` details,
+`Ctrl+K` connect, `Ctrl+D` disconnect, `Ctrl+Q` quit.
+
+**Startup speed.** The API is a single ~1.3 MB response, so the fetch takes a
+few seconds and nothing can shrink it. The window does not wait for it: the
+last fetch is cached under `~/.cache/vpn-gate-client/` and shown immediately,
+then rows stream in as they arrive and replace it.
 
 ### 2. CLI Mode
 Connect to a VPN using the command line:

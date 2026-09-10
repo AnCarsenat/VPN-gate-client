@@ -158,18 +158,27 @@ class Worker(QThread):
 
 
 class FetchWorker(QThread):
-    """Fetch the server list off the GUI thread.
+    """Fetch the server list off the GUI thread, emitting rows as they land.
 
-    get_servers() is a blocking HTTP request; running it inline froze the
-    window on every refresh and on startup.
+    The API is one large response, so nothing can make the download itself
+    finish sooner. Emitting each parsed batch lets the table fill from the
+    first second rather than staying empty until the body is complete.
     """
+    batch_ready = pyqtSignal(object)
     fetched = pyqtSignal(object)
+    failed = pyqtSignal(str)
 
     def run(self):
         try:
-            self.fetched.emit(vpncore.get_servers())
+            servers = vpncore.stream_servers(
+                on_batch=self.batch_ready.emit,
+                should_stop=self.isInterruptionRequested)
+            if self.isInterruptionRequested():
+                return
+            self.fetched.emit(servers)
         except Exception as e:
             print(f"Fetch failed: {e}")
+            self.failed.emit(str(e))
             self.fetched.emit([])
 
 
@@ -231,6 +240,16 @@ class ServerModel(QAbstractTableModel):
         self.beginResetModel()
         self._servers = list(servers)
         self.endResetModel()
+
+    def append_servers(self, servers):
+        """Add a streamed batch without resetting the view."""
+        servers = list(servers)
+        if not servers:
+            return
+        first = len(self._servers)
+        self.beginInsertRows(QModelIndex(), first, first + len(servers) - 1)
+        self._servers.extend(servers)
+        self.endInsertRows()
 
     def set_prefer_tcp(self, prefer_tcp):
         """Protocol preference changes the Proto column for dual-stack servers."""
@@ -638,6 +657,9 @@ class VPNWindow(QMainWindow):
         self.is_quitting = False
         self.vpn_active = False
         self.worker = None
+        self.streaming = False
+        self.is_fetching = False
+        self.fetch_error = None
 
         self.model = ServerModel(self.favourites, self)
         self.proxy = ServerFilterProxy(self.favourites, self)
@@ -653,13 +675,16 @@ class VPNWindow(QMainWindow):
         self.stats_worker = StatsWorker()
         self.stats_worker.stats_updated.connect(self.on_stats_updated)
         self.fetch_worker = FetchWorker()
+        self.fetch_worker.batch_ready.connect(self.on_servers_batch)
         self.fetch_worker.fetched.connect(self.on_servers_fetched)
+        self.fetch_worker.failed.connect(self.on_fetch_failed)
 
         self.stats_timer = QTimer(self)
         self.stats_timer.timeout.connect(self.tick)
         self.stats_timer.start(3000)
 
         self.refresh_active_state()
+        self.load_cached_servers()
         self.load_servers()
 
     # -- construction -------------------------------------------------------
@@ -852,6 +877,9 @@ class VPNWindow(QMainWindow):
         self.status_label.setText("Status: Shutting down...")
         QApplication.processEvents()
 
+        # Abandon an in-flight fetch rather than sitting through the download.
+        self.fetch_worker.requestInterruption()
+
         for thread in (self.worker, self.fetch_worker, self.stats_worker):
             if thread is not None and thread.isRunning():
                 thread.wait(15000)
@@ -872,7 +900,7 @@ class VPNWindow(QMainWindow):
         return self.vpn_active
 
     def tick(self):
-        if self.is_busy or self.is_quitting:
+        if self.is_busy or self.is_quitting or self.is_fetching:
             return
         was_active = self.vpn_active
         if self.refresh_active_state() != was_active:
@@ -885,18 +913,23 @@ class VPNWindow(QMainWindow):
             self.is_busy = is_busy
         active = self.vpn_active
 
-        ok_colour, bad_colour = status_colours(self.palette())
-        if active:
-            self.status_label.setText("Status: VPN IS ACTIVE")
-            self.status_label.setStyleSheet(f"color: {ok_colour};")
-        else:
-            self.status_label.setText("Status: DISCONNECTED")
-            self.status_label.setStyleSheet(f"color: {bad_colour};")
-            self.stats_label.setText("")
+        # A fetch writes its own progress into the status line, so only
+        # overwrite it with the VPN state once nothing transient is running.
+        if not self.is_busy and not self.is_fetching:
+            ok_colour, bad_colour = status_colours(self.palette())
+            if active:
+                self.status_label.setText("Status: VPN IS ACTIVE")
+                self.status_label.setStyleSheet(f"color: {ok_colour};")
+            else:
+                self.status_label.setText("Status: DISCONNECTED")
+                self.status_label.setStyleSheet(f"color: {bad_colour};")
+                self.stats_label.setText("")
 
         self.act_connect.setEnabled(not active and not self.is_busy)
         self.act_disconnect.setEnabled(active and not self.is_busy)
-        self.act_refresh.setEnabled(not self.is_busy)
+        self.act_refresh.setEnabled(not self.is_busy and not self.is_fetching)
+        # Only a connect/disconnect locks the table. A fetch streams into it,
+        # so it stays usable throughout.
         self.view.setEnabled(not self.is_busy)
 
     def on_stats_updated(self, stats):
@@ -908,18 +941,54 @@ class VPNWindow(QMainWindow):
 
     # -- servers ------------------------------------------------------------
 
+    def load_cached_servers(self):
+        """Show the previous fetch immediately, so the window is never empty."""
+        servers, age = vpncore.load_cached_servers()
+        if not servers:
+            return
+        self.model.set_servers(servers)
+        minutes = int(age // 60)
+        when = f"{minutes} min" if minutes < 90 else f"{minutes // 60} h"
+        self.status_label.setText(
+            f"Status: showing {len(servers)} cached servers ({when} old), refreshing...")
+
     def load_servers(self):
         if self.fetch_worker.isRunning() or self.is_quitting:
             return
-        self.status_label.setText("Status: Fetching servers...")
-        self.update_ui_state(is_busy=True)
+        self.fetch_error = None
+        self.streaming = False
+        self.is_fetching = True
+        if self.model.rowCount() == 0:
+            self.status_label.setText("Status: fetching servers...")
+        self.update_ui_state()
         self.fetch_worker.start()
 
+    def on_servers_batch(self, batch):
+        """First batch replaces the cached list; later ones extend it."""
+        if self.is_quitting:
+            return
+        if not self.streaming:
+            self.streaming = True
+            self.model.set_servers(batch)
+        else:
+            self.model.append_servers(batch)
+        self.status_label.setText(f"Status: loading... {self.model.rowCount()} servers")
+
+    def on_fetch_failed(self, message):
+        self.fetch_error = message
+
     def on_servers_fetched(self, servers):
-        self.model.set_servers(servers)
-        self.update_ui_state(is_busy=False)
-        if not servers:
+        # A failed stream keeps whatever the cache gave us rather than
+        # blanking the table.
+        if servers:
+            self.model.set_servers(servers)
+        self.streaming = False
+        self.is_fetching = False
+        self.update_ui_state()
+        if not servers and self.model.rowCount() == 0:
             self.status_label.setText("Status: Could not fetch server list")
+        elif not servers:
+            self.status_label.setText("Status: refresh failed, showing cached servers")
 
     def on_proto_changed(self, action):
         self.model.set_prefer_tcp(action.data() == "tcp")
