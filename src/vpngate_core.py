@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import requests
 import base64
+import gzip
 import subprocess
 import os
 import re
@@ -10,36 +11,132 @@ API_URL = "https://www.vpngate.net/api/iphone/"
 CONNECTION_NAME = "vpngate-active"
 PID_FILE = "/tmp/vpngate-cli.pid"
 
-def get_servers():
+CACHE_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+    "vpn-gate-client")
+CACHE_FILE = os.path.join(CACHE_DIR, "servers.csv.gz")
+
+
+def parse_server(header, line):
+    """Turn one CSV row into a server dict, or None if it is not one."""
+    if not line or line.startswith("*") or line.startswith("#") or not line.strip():
+        return None
+    parts = line.split(",")
+    if len(parts) < 15:
+        return None
+
+    server = dict(zip(header, parts))
     try:
-        response = requests.get(API_URL, timeout=10)
+        config_data = base64.b64decode(
+            server['OpenVPN_ConfigData_Base64']).decode('utf-8', errors='ignore')
+    except Exception:
+        return None
+
+    lowered = config_data.lower()
+    server['has_udp'] = "proto udp" in lowered
+    server['has_tcp'] = "proto tcp" in lowered or "proto udp" not in lowered
+    server['config_text'] = config_data
+    return server
+
+
+def parse_lines(lines):
+    """Parse a whole response body that is already in memory."""
+    header = None
+    servers = []
+    for line in lines:
+        if header is None:
+            if line.startswith("#"):
+                header = line[1:].split(",")
+            continue
+        server = parse_server(header, line)
+        if server is not None:
+            servers.append(server)
+    return servers
+
+
+def stream_servers(on_batch=None, batch_size=8, timeout=20, cache=True,
+                   should_stop=None):
+    """Fetch the server list, parsing rows as they arrive off the socket.
+
+    The API is a single ~1.3 MB response and the whole cost is the download;
+    parsing is free. Streaming does not make it finish sooner, it makes the
+    first rows usable about a second in instead of after the whole body.
+
+    on_batch, if given, is called with each new group of servers as it is
+    parsed. The full list is returned at the end regardless.
+
+    should_stop, if given, is polled per row; returning True abandons the
+    download. That keeps shutdown from having to sit through a fetch.
+    """
+    header = None
+    servers = []
+    batch = []
+    raw_lines = []
+
+    with requests.get(API_URL, timeout=timeout, stream=True) as response:
         response.raise_for_status()
-        lines = response.text.splitlines()
-        if len(lines) < 2:
-            return []
-        
-        header = lines[1][1:].split(",")
-        servers = []
-        for line in lines[2:]:
-            if line.startswith("*") or line.startswith("#") or not line.strip():
+        for raw in response.iter_lines(decode_unicode=True):
+            if should_stop is not None and should_stop():
+                return servers
+
+            line = raw if isinstance(raw, str) else raw.decode("utf-8", "ignore")
+            raw_lines.append(line)
+
+            if header is None:
+                if line.startswith("#"):
+                    header = line[1:].split(",")
                 continue
-            parts = line.split(",")
-            if len(parts) < 15:
+
+            server = parse_server(header, line)
+            if server is None:
                 continue
-            server = dict(zip(header, parts))
-            
-            try:
-                config_data = base64.b64decode(server['OpenVPN_ConfigData_Base64']).decode('utf-8', errors='ignore')
-                server['has_udp'] = "proto udp" in config_data.lower()
-                server['has_tcp'] = "proto tcp" in config_data.lower() or "proto udp" not in config_data.lower()
-                server['config_text'] = config_data
-                servers.append(server)
-            except:
-                continue
-        return servers
+
+            servers.append(server)
+            batch.append(server)
+            if on_batch is not None and len(batch) >= batch_size:
+                on_batch(list(batch))
+                batch = []
+
+    if on_batch is not None and batch:
+        on_batch(list(batch))
+
+    if cache and servers:
+        save_cache(raw_lines)
+    return servers
+
+
+def get_servers():
+    """Blocking fetch of the whole list. Kept for the CLI."""
+    try:
+        return stream_servers()
     except Exception as e:
         print(f"Error fetching servers: {e}")
         return []
+
+
+def save_cache(lines):
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with gzip.open(CACHE_FILE, "wt", encoding="utf-8") as handle:
+            handle.write("\n".join(lines))
+    except OSError as error:
+        print(f"Could not write cache: {error}")
+
+
+def load_cached_servers(max_age=86400):
+    """Last fetch, for showing something instantly while the refresh runs.
+
+    Returns (servers, age_in_seconds), or ([], None) when there is no usable
+    cache. Stale entries are still returned if they parse - the caller shows
+    them as stale rather than showing an empty window.
+    """
+    try:
+        age = time.time() - os.path.getmtime(CACHE_FILE)
+        with gzip.open(CACHE_FILE, "rt", encoding="utf-8") as handle:
+            servers = parse_lines(handle.read().splitlines())
+        return servers, age
+    except (OSError, ValueError):
+        return [], None
 
 def is_active():
     res = subprocess.run(["nmcli", "-t", "-f", "NAME,STATE", "connection", "show", "--active"], capture_output=True, text=True)

@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+
+# makepkg artifacts if it is ever run from the repo root (it should not be:
+# $srcdir is ./src, which collides with the source tree)
+/pkg/
+/src/vpn-gate-client/
+*.pkg.tar.zst
+*.tar.gz
+
+# Raw full-desktop screenshots; only the cropped ones in images/ are committed
+/images/raw/
