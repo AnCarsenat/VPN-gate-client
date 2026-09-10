@@ -44,7 +44,8 @@ import re
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QTableView, QPushButton, QLabel,
                              QHeaderView, QMessageBox, QSystemTrayIcon, QMenu,
-                             QLineEdit, QAbstractItemView)
+                             QLineEdit, QAbstractItemView, QDialog,
+                             QTableWidget, QTableWidgetItem, QDialogButtonBox)
 from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QTimer, QAbstractTableModel,
                           QModelIndex, QSortFilterProxyModel, QEvent)
 from PyQt6.QtGui import (QIcon, QAction, QActionGroup, QColor, QKeySequence,
@@ -467,6 +468,128 @@ THEME_EVENTS = tuple(
     ) if event_type is not None)
 
 
+def format_bps(value):
+    """The API reports Speed in bits per second."""
+    try:
+        bits = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    for unit, scale in (("Gbps", 1e9), ("Mbps", 1e6), ("kbps", 1e3)):
+        if bits >= scale:
+            return f"{bits / scale:.2f} {unit}"
+    return f"{bits:.0f} bps"
+
+
+def format_bytes(value):
+    try:
+        count = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    for unit, scale in (("TB", 1024 ** 4), ("GB", 1024 ** 3),
+                        ("MB", 1024 ** 2), ("KB", 1024)):
+        if count >= scale:
+            return f"{count / scale:.2f} {unit}"
+    return f"{count:.0f} B"
+
+
+def format_uptime(value):
+    """Uptime arrives as milliseconds."""
+    try:
+        seconds = int(value) // 1000
+    except (TypeError, ValueError):
+        return "n/a"
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes = seconds // 60
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def technical_rows(server, model):
+    """Every field worth showing, raw value alongside the friendly one."""
+    score = server.get("Score", "0")
+    ping = server.get("Ping", "")
+    speed = server.get("Speed", "0")
+    protocols = ", ".join(
+        [name for name, present in (("UDP", server.get("has_udp")),
+                                    ("TCP", server.get("has_tcp"))) if present]) or "unknown"
+
+    return [
+        ("Host name", server.get("HostName", "")),
+        ("IP address", server.get("IP", "")),
+        ("Country", f"{server.get('CountryLong', '')} ({server.get('CountryShort', '')})"),
+        ("Score (raw)", f"{score}  \u2192  {model.display(server, COL_RATING)}"),
+        ("Ping (raw)", f"{ping or 'n/a'} ms"),
+        ("Speed", f"{format_bps(speed)}   ({speed} bps)"),
+        ("Protocols offered", protocols),
+        ("Shown as", model.protocol(server)),
+        ("VPN sessions", server.get("NumVpnSessions", "?")),
+        ("Total users", server.get("TotalUsers", "?")),
+        ("Total traffic", f"{format_bytes(server.get('TotalTraffic', 0))}"),
+        ("Uptime", f"{format_uptime(server.get('Uptime', 0))}"),
+        ("Log policy", server.get("LogType", "unknown")),
+        ("Operator", server.get("Operator", "")),
+        ("Message", server.get("Message", "")),
+    ]
+
+
+class ServerDetailsDialog(QDialog):
+    """Read-only dump of everything the API reports for one server."""
+
+    def __init__(self, server, model, parent=None):
+        super().__init__(parent)
+        self.server = server
+        self.setWindowTitle(f"Technical details - {server.get('HostName', 'server')}")
+        self.resize(560, 480)
+
+        self.rows = technical_rows(server, model)
+
+        layout = QVBoxLayout(self)
+        table = QTableWidget(len(self.rows), 2, self)
+        table.setHorizontalHeaderLabels(["Field", "Value"])
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setWordWrap(True)
+
+        for row, (label, value) in enumerate(self.rows):
+            name_item = QTableWidgetItem(label)
+            font = name_item.font()
+            font.setBold(True)
+            name_item.setFont(font)
+            table.setItem(row, 0, name_item)
+            table.setItem(row, 1, QTableWidgetItem(str(value)))
+
+        table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        table.resizeRowsToContents()
+        layout.addWidget(table)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
+        copy_all = buttons.addButton("Copy all", QDialogButtonBox.ButtonRole.ActionRole)
+        copy_all.clicked.connect(self.copy_all)
+        copy_config = buttons.addButton("Copy OpenVPN config",
+                                        QDialogButtonBox.ButtonRole.ActionRole)
+        copy_config.setEnabled(bool(server.get("config_text")))
+        copy_config.clicked.connect(self.copy_config)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def as_text(self):
+        width = max(len(label) for label, _ in self.rows) + 1
+        return "\n".join(f"{label + ':':<{width}} {value}" for label, value in self.rows)
+
+    def copy_all(self):
+        QApplication.clipboard().setText(self.as_text())
+
+    def copy_config(self):
+        QApplication.clipboard().setText(self.server.get("config_text", ""))
+
+
 def status_colours(palette):
     """Connected / disconnected colours that stay readable in either theme."""
     if palette.color(QPalette.ColorRole.Base).lightness() < 128:
@@ -554,6 +677,10 @@ class VPNWindow(QMainWindow):
         self.act_disconnect.setShortcut(QKeySequence("Ctrl+D"))
         self.act_disconnect.triggered.connect(self.start_disconnect)
 
+        self.act_details = QAction("Technical &details...", self)
+        self.act_details.setShortcut(QKeySequence("Ctrl+I"))
+        self.act_details.triggered.connect(self.show_details_for_selection)
+
         self.act_focus_search = QAction("&Search", self)
         self.act_focus_search.setShortcut(QKeySequence.StandardKey.Find)
         self.act_focus_search.triggered.connect(self.focus_search)
@@ -576,6 +703,8 @@ class VPNWindow(QMainWindow):
         conn_menu = menubar.addMenu("&Connection")
         conn_menu.addAction(self.act_connect)
         conn_menu.addAction(self.act_disconnect)
+        conn_menu.addSeparator()
+        conn_menu.addAction(self.act_details)
 
         prefs_menu = menubar.addMenu("&Preferences")
         proto_menu = prefs_menu.addMenu("Protocol preference")
@@ -654,7 +783,10 @@ class VPNWindow(QMainWindow):
 
     def build_tray(self):
         icon = load_app_icon()
-        self.setWindowIcon(icon)
+        # Deliberately no setWindowIcon: the title bar stays bare. An explicit
+        # empty icon is needed because otherwise the window inherits the
+        # application icon.
+        self.setWindowIcon(QIcon())
 
         self.tray_icon = QSystemTrayIcon(self)
         self.tray_icon.setIcon(icon)
@@ -812,6 +944,16 @@ class VPNWindow(QMainWindow):
             cleaned = re.sub(r"@(favorite|favourite|fav)\b", " ", text, flags=re.IGNORECASE)
             self.search_box.setText(" ".join(cleaned.split()))
 
+    def show_details_for_selection(self):
+        server = self.selected_server()
+        if server is None:
+            QMessageBox.warning(self, "Selection Required", "Please select a server.")
+            return
+        self.show_details(server)
+
+    def show_details(self, server):
+        ServerDetailsDialog(server, self.model, self).exec()
+
     def show_search_help(self):
         QMessageBox.information(self, "Search syntax", (
             "Qualifiers:\n"
@@ -863,6 +1005,11 @@ class VPNWindow(QMainWindow):
         disconnect = menu.addAction("Disconnect")
         disconnect.setEnabled(self.vpn_active and not self.is_busy)
         disconnect.triggered.connect(self.start_disconnect)
+
+        menu.addSeparator()
+
+        details = menu.addAction("Technical details...")
+        details.triggered.connect(lambda: self.show_details(server))
 
         menu.addSeparator()
 
