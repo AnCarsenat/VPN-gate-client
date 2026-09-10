@@ -38,12 +38,17 @@ def _importable(module):
 
 check_dependencies()
 
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QTableWidget, QTableWidgetItem, 
-                             QPushButton, QLabel, QRadioButton, QButtonGroup, 
-                             QHeaderView, QMessageBox, QSystemTrayIcon, QMenu)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QIcon, QAction, QPalette, QColor
+import json
+import re
+
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QTableView, QPushButton, QLabel,
+                             QHeaderView, QMessageBox, QSystemTrayIcon, QMenu,
+                             QLineEdit, QAbstractItemView)
+from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QTimer, QAbstractTableModel,
+                          QModelIndex, QSortFilterProxyModel, QEvent)
+from PyQt6.QtGui import (QIcon, QAction, QActionGroup, QColor, QKeySequence,
+                         QPalette)
 
 import vpngate_core as vpncore
 
@@ -51,6 +56,11 @@ ICON_DIR = os.path.join(SCRIPT_DIR, "assets", "icons")
 ICON_256 = os.path.join(ICON_DIR, "256.png")
 ICON_64 = os.path.join(ICON_DIR, "64.png")
 ICON_32 = os.path.join(ICON_DIR, "32.png")
+
+CONFIG_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "vpn-gate-client")
+FAVOURITES_FILE = os.path.join(CONFIG_DIR, "favourites.json")
 
 
 def load_app_icon():
@@ -66,15 +76,75 @@ def load_app_icon():
     return QIcon.fromTheme("network-vpn")
 
 
+def country_flag(country_short):
+    """Turn an ISO 3166-1 alpha-2 code into its regional-indicator flag emoji."""
+    code = (country_short or "").strip().upper()
+    if len(code) != 2 or not code.isalpha():
+        return ""
+    return "".join(chr(0x1F1E6 + ord(char) - ord("A")) for char in code)
+
+
+# ---------------------------------------------------------------------------
+# Favourites
+# ---------------------------------------------------------------------------
+
+class Favourites:
+    """Favourite servers, keyed by HostName and persisted under XDG config.
+
+    HostName is the key rather than IP: a full API fetch returns unique
+    HostName values but can repeat an IP, and VPN Gate rotates IPs between
+    fetches.
+    """
+
+    def __init__(self):
+        self._hosts = set()
+        self.load()
+
+    def load(self):
+        try:
+            with open(FAVOURITES_FILE, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, list):
+                self._hosts = {str(host) for host in data}
+        except (OSError, ValueError):
+            self._hosts = set()
+
+    def save(self):
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(FAVOURITES_FILE, "w", encoding="utf-8") as handle:
+                json.dump(sorted(self._hosts), handle, indent=2)
+        except OSError as error:
+            print(f"Could not save favourites: {error}")
+
+    def contains(self, server):
+        return server.get("HostName", "") in self._hosts
+
+    def toggle(self, server):
+        host = server.get("HostName", "")
+        if not host:
+            return False
+        if host in self._hosts:
+            self._hosts.discard(host)
+        else:
+            self._hosts.add(host)
+        self.save()
+        return host in self._hosts
+
+
+# ---------------------------------------------------------------------------
+# Workers
+# ---------------------------------------------------------------------------
+
 class Worker(QThread):
     finished = pyqtSignal(bool, str)
-    
+
     def __init__(self, action, server=None, proto=None):
         super().__init__()
         self.action = action
         self.server = server
         self.proto = proto
-        
+
     def run(self):
         try:
             if self.action == "connect":
@@ -85,280 +155,799 @@ class Worker(QThread):
         except Exception as e:
             self.finished.emit(False, str(e))
 
+
+class FetchWorker(QThread):
+    """Fetch the server list off the GUI thread.
+
+    get_servers() is a blocking HTTP request; running it inline froze the
+    window on every refresh and on startup.
+    """
+    fetched = pyqtSignal(object)
+
+    def run(self):
+        try:
+            self.fetched.emit(vpncore.get_servers())
+        except Exception as e:
+            print(f"Fetch failed: {e}")
+            self.fetched.emit([])
+
+
 class StatsWorker(QThread):
     stats_updated = pyqtSignal(object)
-    
+
     def run(self):
         stats = vpncore.get_stats()
         self.stats_updated.emit(stats)
 
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+COL_FAV, COL_COUNTRY, COL_PING, COL_RATING, COL_IP, COL_PROTO = range(6)
+
+# Rating tiers, worst to best. Score is a raw integer from the API, roughly
+# 0 - 3,000,000 across a full fetch.
+RATING_STEP = 600000
+RATING_LABELS = ["Very low", "Low", "Fair", "Good", "Excellent"]
+
+# Ping thresholds in ms, best to worst.
+PING_TIERS = [(60, 0), (120, 1), (200, 2), (400, 3)]
+
+
+def server_ping(server):
+    try:
+        return int(server.get("Ping", "0"))
+    except (TypeError, ValueError):
+        return 9999
+
+
+def server_score(server):
+    try:
+        return int(server.get("Score", "0"))
+    except (TypeError, ValueError):
+        return 0
+
+
+def rating_tier(server):
+    return min(server_score(server) // RATING_STEP, 4)
+
+
+class ServerModel(QAbstractTableModel):
+    HEADERS = ["★", "Country", "Ping", "Rating", "IP", "Proto"]
+
+    def __init__(self, favourites, parent=None):
+        super().__init__(parent)
+        self._servers = []
+        self._favourites = favourites
+        self._prefer_tcp = False
+        self._best_to_worst = []
+        self._worst_to_best = []
+
+    # -- data plumbing ------------------------------------------------------
+
+    def set_servers(self, servers):
+        self.beginResetModel()
+        self._servers = list(servers)
+        self.endResetModel()
+
+    def set_prefer_tcp(self, prefer_tcp):
+        """Protocol preference changes the Proto column for dual-stack servers."""
+        self._prefer_tcp = prefer_tcp
+        self.refresh_all()
+
+    def set_palette_colours(self, palette):
+        """Pick tier colours that stay legible against the active theme."""
+        dark = palette.color(QPalette.ColorRole.Base).lightness() < 128
+        if dark:
+            self._worst_to_best = ["#e74c3c", "#e67e22", "#f1c40f", "#7ed957", "#2ecc71"]
+        else:
+            self._worst_to_best = ["#c0392b", "#b05a00", "#8a7000", "#3f9142", "#1e8449"]
+        self._best_to_worst = list(reversed(self._worst_to_best))
+        self.refresh_all()
+
+    def refresh_all(self):
+        if self._servers:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(len(self._servers) - 1, len(self.HEADERS) - 1))
+
+    def refresh_row(self, row):
+        if 0 <= row < len(self._servers):
+            self.dataChanged.emit(self.index(row, 0),
+                                  self.index(row, len(self.HEADERS) - 1))
+
+    def server_at(self, row):
+        if 0 <= row < len(self._servers):
+            return self._servers[row]
+        return None
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._servers)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.HEADERS)
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+        if orientation == Qt.Orientation.Horizontal:
+            return self.HEADERS[section]
+        return str(section + 1)
+
+    # -- per-column values --------------------------------------------------
+
+    def protocol(self, server):
+        if not server.get("has_udp"):
+            return "TCP"
+        if self._prefer_tcp and server.get("has_tcp"):
+            return "TCP"
+        return "UDP"
+
+    def display(self, server, col):
+        if col == COL_FAV:
+            return "★" if self._favourites.contains(server) else ""
+        if col == COL_COUNTRY:
+            flag = country_flag(server.get("CountryShort", ""))
+            code = server.get("CountryShort", "??")
+            return f"{flag} {code}".strip()
+        if col == COL_PING:
+            ping = server_ping(server)
+            return "n/a" if ping >= 9999 else f"{ping} ms"
+        if col == COL_RATING:
+            return RATING_LABELS[rating_tier(server)]
+        if col == COL_IP:
+            return server.get("IP", "")
+        if col == COL_PROTO:
+            return self.protocol(server)
+        return ""
+
+    def sort_key(self, server, col):
+        if col == COL_FAV:
+            return 1 if self._favourites.contains(server) else 0
+        if col == COL_COUNTRY:
+            return server.get("CountryShort", "")
+        if col == COL_PING:
+            return server_ping(server)
+        if col == COL_RATING:
+            return server_score(server)
+        if col == COL_IP:
+            # Sort dotted quads numerically rather than lexically.
+            try:
+                return tuple(int(part) for part in server.get("IP", "").split("."))
+            except ValueError:
+                return (0, 0, 0, 0)
+        if col == COL_PROTO:
+            return self.protocol(server)
+        return ""
+
+    def colour(self, server, col):
+        if not self._worst_to_best:
+            return None
+        if col == COL_RATING:
+            return QColor(self._worst_to_best[rating_tier(server)])
+        if col == COL_PING:
+            ping = server_ping(server)
+            tier = 4
+            for threshold, index in PING_TIERS:
+                if ping < threshold:
+                    tier = index
+                    break
+            return QColor(self._best_to_worst[tier])
+        if col == COL_PROTO:
+            return QColor("#3498db") if self.protocol(server) == "UDP" else QColor("#e67e22")
+        return None
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        server = self._servers[index.row()]
+        col = index.column()
+
+        if role == Qt.ItemDataRole.DisplayRole:
+            return self.display(server, col)
+        if role == Qt.ItemDataRole.UserRole:
+            return self.sort_key(server, col)
+        if role == Qt.ItemDataRole.ForegroundRole:
+            return self.colour(server, col)
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            if col in (COL_FAV, COL_PING, COL_PROTO):
+                return Qt.AlignmentFlag.AlignCenter
+            return Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
+        if role == Qt.ItemDataRole.ToolTipRole:
+            return (f"{server.get('CountryLong', '')}\n"
+                    f"Host: {server.get('HostName', '')}\n"
+                    f"Score: {server.get('Score', '0')}\n"
+                    f"Sessions: {server.get('NumVpnSessions', '?')}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Search
+# ---------------------------------------------------------------------------
+
+QUALIFIER_RE = re.compile(
+    r"@?(host|country|ip|proto|protocol|rating|ping)\s*:\s*(\S+)", re.IGNORECASE)
+FLAG_RE = re.compile(r"@(favorite|favourite|fav|udp|tcp)\b", re.IGNORECASE)
+FAVOURITE_FLAGS = {"favorite", "favourite", "fav"}
+
+
+class ServerFilterProxy(QSortFilterProxyModel):
+    """GitHub-style search: `@country:FR @favorite fast`.
+
+    Qualifiers: @host: @country: @ip: @proto: @rating: @ping:
+    Flags:      @favorite @udp @tcp
+    Anything left over is free text, matched against country, IP and host.
+    """
+
+    def __init__(self, favourites, parent=None):
+        super().__init__(parent)
+        self._favourites = favourites
+        self._qualifiers = []
+        self._flags = set()
+        self._free_text = ""
+        self.setSortRole(Qt.ItemDataRole.UserRole)
+
+    def set_query(self, text):
+        text = text or ""
+        self._qualifiers = [(key.lower(), value.lower())
+                            for key, value in QUALIFIER_RE.findall(text)]
+        self._flags = {flag.lower() for flag in FLAG_RE.findall(text)}
+        leftover = FLAG_RE.sub(" ", QUALIFIER_RE.sub(" ", text))
+        self._free_text = " ".join(leftover.split()).lower()
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row, source_parent):
+        model = self.sourceModel()
+        server = model.server_at(source_row)
+        if server is None:
+            return False
+
+        if self._flags & FAVOURITE_FLAGS and not self._favourites.contains(server):
+            return False
+
+        protocol = model.protocol(server).lower()
+        if "udp" in self._flags and protocol != "udp":
+            return False
+        if "tcp" in self._flags and protocol != "tcp":
+            return False
+
+        for key, value in self._qualifiers:
+            if not self._matches(model, server, key, value):
+                return False
+
+        if self._free_text:
+            haystack = " ".join([
+                server.get("CountryShort", ""), server.get("CountryLong", ""),
+                server.get("IP", ""), server.get("HostName", ""),
+            ]).lower()
+            if self._free_text not in haystack:
+                return False
+
+        return True
+
+    def _matches(self, model, server, key, value):
+        if key == "host":
+            return value in server.get("HostName", "").lower()
+        if key == "country":
+            return (value in server.get("CountryShort", "").lower()
+                    or value in server.get("CountryLong", "").lower())
+        if key == "ip":
+            return value in server.get("IP", "").lower()
+        if key in ("proto", "protocol"):
+            return model.protocol(server).lower() == value
+        if key == "rating":
+            return value in model.display(server, COL_RATING).lower()
+        if key == "ping":
+            return self._compare_number(server_ping(server), value)
+        return True
+
+    @staticmethod
+    def _compare_number(actual, expression):
+        """Support @ping:<100, @ping:>50, and a bare @ping:40 upper bound."""
+        try:
+            if expression.startswith("<"):
+                return actual < int(expression[1:])
+            if expression.startswith(">"):
+                return actual > int(expression[1:])
+            return actual <= int(expression)
+        except ValueError:
+            return True
+
+
+# Event types that mean "the theme moved under us". ThemeChange is not exposed
+# by every PyQt6 build, and an AttributeError raised inside a reimplemented
+# virtual is turned into an abort() with no traceback, so resolve it defensively.
+THEME_EVENTS = tuple(
+    event_type for event_type in (
+        getattr(QEvent.Type, "PaletteChange", None),
+        getattr(QEvent.Type, "ApplicationPaletteChange", None),
+        getattr(QEvent.Type, "ThemeChange", None),
+        getattr(QEvent.Type, "StyleChange", None),
+    ) if event_type is not None)
+
+
+def status_colours(palette):
+    """Connected / disconnected colours that stay readable in either theme."""
+    if palette.color(QPalette.ColorRole.Base).lightness() < 128:
+        return "#2ecc71", "#e74c3c"
+    return "#1e8449", "#c0392b"
+
+
+def button_for(action, parent=None):
+    """A QPushButton driven by a QAction.
+
+    QPushButton has no setDefaultAction (that is QToolButton), so mirror the
+    action's label and enabled state manually. This keeps one QAction as the
+    single source of truth for the menubar, the buttons and the row menu.
+    """
+    button = QPushButton(action.text().replace("&", ""), parent)
+    button.clicked.connect(action.trigger)
+
+    def sync():
+        button.setText(action.text().replace("&", ""))
+        button.setEnabled(action.isEnabled())
+        button.setToolTip(action.shortcut().toString())
+
+    sync()
+    action.changed.connect(sync)
+    return button
+
+
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
+
 class VPNWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("VPN Gate Client")
-        self.setMinimumSize(950, 650)
-        
-        self.all_servers = []
-        self.filtered_servers = []
-        self.is_busy = False
-        
-        # Dark Theme Palette
-        self.bg_dark = "#1e1e1e"
-        self.bg_card = "#2d2d2d"
-        self.text_light = "#ecf0f1"
-        self.accent_green = "#2ecc71"
-        self.accent_red = "#e74c3c"
-        
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        self.main_layout = QVBoxLayout(central_widget)
-        self.setStyleSheet(f"background-color: {self.bg_dark}; color: {self.text_light};")
-        
-        # 1. TOP: Server List
-        self.table = QTableWidget()
-        self.table.setColumnCount(6)
-        self.table.setHorizontalHeaderLabels(["No", "Ping", "Rating", "Country", "IP", "Protocol"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.setAlternatingRowColors(True)
-        self.table.setStyleSheet(f"""
-            QTableWidget {{ background-color: {self.bg_card}; color: {self.text_light}; gridline-color: #444; border: none; }}
-            QHeaderView::section {{ background-color: #333; color: white; padding: 5px; border: 1px solid #444; }}
-            QTableWidget::item:selected {{ background-color: #3498db; }}
-        """)
-        self.table.horizontalHeader().sectionClicked.connect(self.sort_by_column)
-        self.current_sort_col = 2  # Default sort by Rating
-        self.sort_reverse = True
-        self.main_layout.addWidget(self.table)
-        
-        # 2. MIDDLE: Detailed Status
-        self.status_container = QWidget()
-        self.status_layout = QVBoxLayout(self.status_container)
-        self.status_label = QLabel("Status: DISCONNECTED")
-        self.status_label.setStyleSheet("font-size: 16px; font-weight: bold;")
-        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_layout.addWidget(self.status_label)
-        
-        self.stats_label = QLabel("")
-        self.stats_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.stats_label.setStyleSheet("font-family: monospace; color: #bdc3c7;")
-        self.status_layout.addWidget(self.stats_label)
-        
-        self.status_container.setStyleSheet(f"background: {self.bg_card}; border: 1px solid #444; border-radius: 8px; margin: 5px;")
-        self.main_layout.addWidget(self.status_container)
-        
-        # 3. BOTTOM: Controls
-        controls_layout = QHBoxLayout()
-        self.radio_group = QButtonGroup(self)
-        self.radio_udp = QRadioButton("UDP Preference")
-        self.radio_tcp = QRadioButton("TCP Preference")
-        self.radio_all = QRadioButton("Show All")
-        self.radio_udp.setChecked(True)
-        
-        for r in [self.radio_udp, self.radio_tcp, self.radio_all]:
-            self.radio_group.addButton(r)
-            controls_layout.addWidget(r)
-        
-        self.radio_group.buttonClicked.connect(self.apply_filter)
-        controls_layout.addStretch()
-        
-        # Action Buttons
-        self.btn_refresh = QPushButton("Refresh List")
-        self.btn_refresh.clicked.connect(self.load_servers)
-        
-        self.btn_connect = QPushButton("Connect")
-        self.btn_connect.setStyleSheet(f"background-color: {self.accent_green}; color: white; font-weight: bold; border-radius: 4px;")
-        self.btn_connect.setMinimumHeight(40)
-        self.btn_connect.setMinimumWidth(120)
-        self.btn_connect.clicked.connect(self.start_connect)
-        
-        self.btn_disconnect = QPushButton("Disconnect")
-        self.btn_disconnect.setStyleSheet(f"background-color: {self.accent_red}; color: white; font-weight: bold; border-radius: 4px;")
-        self.btn_disconnect.setMinimumHeight(40)
-        self.btn_disconnect.setMinimumWidth(120)
-        self.btn_disconnect.clicked.connect(self.start_disconnect)
-        
-        controls_layout.addWidget(self.btn_refresh)
-        controls_layout.addWidget(self.btn_connect)
-        controls_layout.addWidget(self.btn_disconnect)
-        self.main_layout.addLayout(controls_layout)
-        
-        # System Tray
-        self.tray_icon = QSystemTrayIcon(self)
-        
-        icon = load_app_icon()
-            
-        self.tray_icon.setIcon(icon)
-        self.setWindowIcon(icon)
-        
-        tray_menu = QMenu()
-        show_action = QAction("Open Client", self)
-        show_action.triggered.connect(self.showNormal)
-        quit_action = QAction("Kill App & VPN", self)
-        quit_action.triggered.connect(self.quit_app)
-        
-        tray_menu.addAction(show_action)
-        tray_menu.addSeparator()
-        tray_menu.addAction(quit_action)
-        
-        self.tray_icon.setContextMenu(tray_menu)
-        self.tray_icon.show()
-        self.tray_icon.activated.connect(self.on_tray_activated)
+        # setWindowTitle below already delivers a change event, and PyQt6 turns
+        # any exception raised inside a reimplemented virtual into an abort()
+        # rather than a traceback. Keep this first so changeEvent can bail out
+        # until the model exists.
+        self.model = None
 
-        # Workers & Timers
+        self.setWindowTitle("VPN Gate Client")
+        self.setMinimumSize(900, 600)
+
+        self.favourites = Favourites()
+        self.is_busy = False
+        self.is_quitting = False
+        self.vpn_active = False
+        self.worker = None
+
+        self.model = ServerModel(self.favourites, self)
+        self.proxy = ServerFilterProxy(self.favourites, self)
+        self.proxy.setSourceModel(self.model)
+
+        self.build_actions()
+        self.build_menubar()
+        self.build_body()
+        self.build_tray()
+
+        self.model.set_palette_colours(self.palette())
+
         self.stats_worker = StatsWorker()
         self.stats_worker.stats_updated.connect(self.on_stats_updated)
-        
-        self.stats_timer = QTimer()
-        self.stats_timer.timeout.connect(self.request_stats)
+        self.fetch_worker = FetchWorker()
+        self.fetch_worker.fetched.connect(self.on_servers_fetched)
+
+        self.stats_timer = QTimer(self)
+        self.stats_timer.timeout.connect(self.tick)
         self.stats_timer.start(3000)
-        
+
+        self.refresh_active_state()
         self.load_servers()
-        self.update_ui_state()
+
+    # -- construction -------------------------------------------------------
+
+    def build_actions(self):
+        self.act_refresh = QAction("&Refresh List", self)
+        self.act_refresh.setShortcut(QKeySequence("Ctrl+R"))
+        self.act_refresh.triggered.connect(self.load_servers)
+
+        self.act_connect = QAction("&Connect", self)
+        self.act_connect.setShortcut(QKeySequence("Ctrl+K"))
+        self.act_connect.triggered.connect(self.start_connect)
+
+        self.act_disconnect = QAction("&Disconnect", self)
+        self.act_disconnect.setShortcut(QKeySequence("Ctrl+D"))
+        self.act_disconnect.triggered.connect(self.start_disconnect)
+
+        self.act_focus_search = QAction("&Search", self)
+        self.act_focus_search.setShortcut(QKeySequence.StandardKey.Find)
+        self.act_focus_search.triggered.connect(self.focus_search)
+
+        self.act_quit = QAction("&Quit", self)
+        self.act_quit.setShortcut(QKeySequence("Ctrl+Q"))
+        self.act_quit.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.act_quit.triggered.connect(self.quit_app)
+        self.addAction(self.act_quit)
+
+    def build_menubar(self):
+        menubar = self.menuBar()
+
+        file_menu = menubar.addMenu("&File")
+        file_menu.addAction(self.act_refresh)
+        file_menu.addAction(self.act_focus_search)
+        file_menu.addSeparator()
+        file_menu.addAction(self.act_quit)
+
+        conn_menu = menubar.addMenu("&Connection")
+        conn_menu.addAction(self.act_connect)
+        conn_menu.addAction(self.act_disconnect)
+
+        prefs_menu = menubar.addMenu("&Preferences")
+        proto_menu = prefs_menu.addMenu("Protocol preference")
+        self.proto_group = QActionGroup(self)
+        self.proto_group.setExclusive(True)
+        for label, key in (("Prefer &UDP", "udp"), ("Prefer &TCP", "tcp"),
+                           ("Show &All", "all")):
+            action = proto_menu.addAction(label)
+            action.setCheckable(True)
+            action.setData(key)
+            self.proto_group.addAction(action)
+        self.proto_group.actions()[0].setChecked(True)
+        self.proto_group.triggered.connect(self.on_proto_changed)
+
+        prefs_menu.addSeparator()
+        self.act_favourites_only = prefs_menu.addAction("Show &favourites only")
+        self.act_favourites_only.setCheckable(True)
+        self.act_favourites_only.toggled.connect(self.on_favourites_only)
+
+        help_menu = menubar.addMenu("&Help")
+        help_menu.addAction("Search &syntax", self.show_search_help)
+
+    def build_body(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText(
+            "Search  —  @country:FR   @host:public-vpn   @favorite   @udp   @ping:<100")
+        self.search_box.setClearButtonEnabled(True)
+        self.search_box.textChanged.connect(self.on_search_changed)
+        layout.addWidget(self.search_box)
+
+        self.view = QTableView()
+        self.view.setModel(self.proxy)
+        self.view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.view.setAlternatingRowColors(True)
+        self.view.setSortingEnabled(True)
+        self.view.sortByColumn(COL_RATING, Qt.SortOrder.DescendingOrder)
+        self.view.verticalHeader().setDefaultSectionSize(24)
+        self.view.doubleClicked.connect(self.on_row_activated)
+        self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.view.customContextMenuRequested.connect(self.show_row_menu)
+
+        header = self.view.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(COL_COUNTRY, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(COL_IP, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.view)
+
+        self.status_label = QLabel("Status: DISCONNECTED")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        font = self.status_label.font()
+        font.setBold(True)
+        font.setPointSize(font.pointSize() + 2)
+        self.status_label.setFont(font)
+        layout.addWidget(self.status_label)
+
+        self.stats_label = QLabel("")
+        self.stats_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.stats_label)
+
+        controls = QHBoxLayout()
+        controls.addStretch()
+        self.btn_refresh = button_for(self.act_refresh, self)
+        self.btn_connect = button_for(self.act_connect, self)
+        self.btn_disconnect = button_for(self.act_disconnect, self)
+        for button in (self.btn_refresh, self.btn_connect, self.btn_disconnect):
+            button.setMinimumHeight(34)
+            button.setMinimumWidth(120)
+            controls.addWidget(button)
+        layout.addLayout(controls)
+
+    def build_tray(self):
+        icon = load_app_icon()
+        self.setWindowIcon(icon)
+
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(icon)
+        self.tray_icon.setToolTip("VPN Gate Client")
+
+        tray_menu = QMenu()
+        show_action = QAction("Open Client", self)
+        show_action.triggered.connect(self.show_window)
+        tray_menu.addAction(show_action)
+        tray_menu.addSeparator()
+        tray_menu.addAction(self.act_disconnect)
+        tray_menu.addSeparator()
+        tray_menu.addAction(self.act_quit)
+
+        self.tray_menu = tray_menu
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self.on_tray_activated)
+        self.tray_icon.show()
+
+    # -- events -------------------------------------------------------------
+
+    def changeEvent(self, event):
+        """Re-derive tier colours when the system theme changes under us."""
+        if self.model is not None and event.type() in THEME_EVENTS:
+            self.model.set_palette_colours(self.palette())
+            self.update_ui_state()
+        super().changeEvent(event)
 
     def on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             if self.isVisible():
                 self.hide()
             else:
-                self.showNormal()
-                self.activateWindow()
+                self.show_window()
+
+    def show_window(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def focus_search(self):
+        self.search_box.setFocus()
+        self.search_box.selectAll()
 
     def closeEvent(self, event):
-        # Only hide when user clicks the window X button
+        # The X button hides to the tray. Ctrl+Q / Quit is the real exit and
+        # sets is_quitting first, so this handler steps out of its way.
+        if self.is_quitting:
+            event.accept()
+            return
         self.hide()
         event.ignore()
 
     def quit_app(self):
-        print("Cleaning up VPN and exiting...")
-        vpncore.disconnect_vpn()
+        if self.is_quitting:
+            return
+        self.is_quitting = True
+
+        # Stop everything that could restart work or block the event loop
+        # before tearing the VPN down.
+        self.stats_timer.stop()
+        self.tray_icon.hide()
+        self.status_label.setText("Status: Shutting down...")
+        QApplication.processEvents()
+
+        for thread in (self.worker, self.fetch_worker, self.stats_worker):
+            if thread is not None and thread.isRunning():
+                thread.wait(15000)
+
+        try:
+            vpncore.disconnect_vpn()
+        except Exception as error:
+            print(f"Cleanup failed: {error}")
+
+        self.close()
         QApplication.instance().quit()
 
-    def update_ui_state(self, is_busy=False):
-        self.is_busy = is_busy
-        active = vpncore.is_active()
-        
+    # -- state --------------------------------------------------------------
+
+    def refresh_active_state(self):
+        """The one place that shells out to nmcli, so filtering stays cheap."""
+        self.vpn_active = vpncore.is_active()
+        return self.vpn_active
+
+    def tick(self):
+        if self.is_busy or self.is_quitting:
+            return
+        was_active = self.vpn_active
+        if self.refresh_active_state() != was_active:
+            self.update_ui_state()
+        if self.vpn_active and not self.stats_worker.isRunning():
+            self.stats_worker.start()
+
+    def update_ui_state(self, is_busy=None):
+        if is_busy is not None:
+            self.is_busy = is_busy
+        active = self.vpn_active
+
+        ok_colour, bad_colour = status_colours(self.palette())
         if active:
             self.status_label.setText("Status: VPN IS ACTIVE")
-            self.status_label.setStyleSheet(f"color: {self.accent_green}; font-size: 16px; font-weight: bold;")
+            self.status_label.setStyleSheet(f"color: {ok_colour};")
         else:
             self.status_label.setText("Status: DISCONNECTED")
-            self.status_label.setStyleSheet(f"color: {self.accent_red}; font-size: 16px; font-weight: bold;")
+            self.status_label.setStyleSheet(f"color: {bad_colour};")
             self.stats_label.setText("")
 
-        if is_busy:
-            self.set_controls_enabled(False)
-        else:
-            self.table.setEnabled(not active)
-            self.btn_connect.setEnabled(not active)
-            self.btn_refresh.setEnabled(not active)
-            self.btn_disconnect.setEnabled(active)
-            for b in self.radio_group.buttons(): b.setEnabled(not active)
-
-    def set_controls_enabled(self, enabled):
-        self.table.setEnabled(enabled)
-        self.btn_connect.setEnabled(enabled)
-        self.btn_disconnect.setEnabled(enabled)
-        self.btn_refresh.setEnabled(enabled)
-        for b in self.radio_group.buttons(): b.setEnabled(enabled)
-
-    def request_stats(self):
-        if not self.is_busy and vpncore.is_active():
-            if not self.stats_worker.isRunning():
-                self.stats_worker.start()
-        elif not self.is_busy:
-            if "ACTIVE" in self.status_label.text():
-                self.update_ui_state()
+        self.act_connect.setEnabled(not active and not self.is_busy)
+        self.act_disconnect.setEnabled(active and not self.is_busy)
+        self.act_refresh.setEnabled(not self.is_busy)
+        self.view.setEnabled(not self.is_busy)
 
     def on_stats_updated(self, stats):
-        if stats and not self.is_busy:
+        if stats and not self.is_busy and not self.is_quitting:
             up, down, ping, loss = stats
-            self.stats_label.setText(f"DOWNLOAD: {down:.1f} KB/s  |  UPLOAD: {up:.1f} KB/s  |  PING: {ping}  |  LOSS: {loss}")
+            self.stats_label.setText(
+                f"DOWNLOAD: {down:.1f} KB/s   |   UPLOAD: {up:.1f} KB/s   |   "
+                f"PING: {ping}   |   LOSS: {loss}")
+
+    # -- servers ------------------------------------------------------------
 
     def load_servers(self):
+        if self.fetch_worker.isRunning() or self.is_quitting:
+            return
         self.status_label.setText("Status: Fetching servers...")
-        self.all_servers = vpncore.get_servers()
-        for i, s in enumerate(self.all_servers):
-            s['gui_idx'] = i
-        self.apply_filter()
+        self.update_ui_state(is_busy=True)
+        self.fetch_worker.start()
 
-    def sort_by_column(self, col):
-        if self.current_sort_col == col:
-            self.sort_reverse = not self.sort_reverse
+    def on_servers_fetched(self, servers):
+        self.model.set_servers(servers)
+        self.update_ui_state(is_busy=False)
+        if not servers:
+            self.status_label.setText("Status: Could not fetch server list")
+
+    def on_proto_changed(self, action):
+        self.model.set_prefer_tcp(action.data() == "tcp")
+        self.proxy.invalidateFilter()
+
+    def on_search_changed(self, text):
+        self.proxy.set_query(text)
+        # Keep the menu checkbox in step with a hand-typed @favorite.
+        has_flag = bool(FLAG_RE.search(text) and
+                        FAVOURITE_FLAGS & {m.lower() for m in FLAG_RE.findall(text)})
+        if self.act_favourites_only.isChecked() != has_flag:
+            self.act_favourites_only.blockSignals(True)
+            self.act_favourites_only.setChecked(has_flag)
+            self.act_favourites_only.blockSignals(False)
+
+    def on_favourites_only(self, checked):
+        text = self.search_box.text()
+        if checked:
+            if not FAVOURITE_FLAGS & {m.lower() for m in FLAG_RE.findall(text)}:
+                self.search_box.setText((text + " @favorite").strip())
         else:
-            self.current_sort_col = col
-            # Numbers descending by default, strings ascending
-            self.sort_reverse = True if col in [0, 1, 2] else False
-        self.apply_filter()
+            cleaned = re.sub(r"@(favorite|favourite|fav)\b", " ", text, flags=re.IGNORECASE)
+            self.search_box.setText(" ".join(cleaned.split()))
 
-    def apply_filter(self):
-        self.filtered_servers = []
-        pref_udp = self.radio_udp.isChecked()
-        pref_tcp = self.radio_tcp.isChecked()
-        pref_all = self.radio_all.isChecked()
-        
-        for s in self.all_servers:
-            if pref_all: self.filtered_servers.append(s)
-            elif pref_udp and s['has_udp']: self.filtered_servers.append(s)
-            elif pref_tcp and s['has_tcp']: self.filtered_servers.append(s)
-            
-        def get_ping(s):
-            p = s.get('Ping', '0')
-            try: return int(p)
-            except: return 9999
+    def show_search_help(self):
+        QMessageBox.information(self, "Search syntax", (
+            "Qualifiers:\n"
+            "  @host:public-vpn-78    match the host name\n"
+            "  @country:FR            country code or full name\n"
+            "  @ip:219.100            match the IP\n"
+            "  @proto:udp             exact protocol\n"
+            "  @ping:<100             ping below a value; also >N, or a bare\n"
+            "                         number meaning at most N\n"
+            "  @rating:good           match the rating label\n\n"
+            "Flags:\n"
+            "  @favorite    @udp    @tcp\n\n"
+            "Anything else is free text, matched against country, IP and host.\n\n"
+            "Example:  @country:JP @udp @ping:<50"))
 
-        def get_proto(s):
-            return "TCP" if (self.radio_tcp.isChecked() and s['has_tcp']) or not s['has_udp'] else "UDP"
+    # -- row actions --------------------------------------------------------
 
-        key_map = {
-            0: lambda x: int(x.get('gui_idx', 0)),
-            1: get_ping,
-            2: lambda x: int(x.get('Score', 0)),
-            3: lambda x: x.get('CountryShort', ''),
-            4: lambda x: x.get('IP', ''),
-            5: get_proto
-        }
-        
-        self.filtered_servers.sort(key=key_map.get(self.current_sort_col, lambda x: 0), reverse=self.sort_reverse)
-        self.update_table()
-        self.update_ui_state()
+    def server_at_view_index(self, index):
+        if not index.isValid():
+            return None
+        return self.model.server_at(self.proxy.mapToSource(index).row())
 
-    def update_table(self):
-        self.table.setRowCount(0)
-        pref_tcp = self.radio_tcp.isChecked()
-        for i, s in enumerate(self.filtered_servers[:100]):
-            self.table.insertRow(i)
-            p_display = "TCP" if (pref_tcp and s['has_tcp']) or not s['has_udp'] else "UDP"
-            # Order: No, Ping, Rating, Country, IP, Protocol
-            items = [str(s.get('gui_idx', i)), s.get('Ping', 'N/A'), s.get('Score', '0'), 
-                     s.get('CountryShort', '??'), s.get('IP', ''), p_display]
-            for col, text in enumerate(items):
-                item = QTableWidgetItem(text)
-                if col == 5: # Protocol column
-                    item.setForeground(Qt.GlobalColor.cyan if text == "UDP" else Qt.GlobalColor.yellow)
-                self.table.setItem(i, col, item)
+    def selected_server(self):
+        rows = self.view.selectionModel().selectedRows()
+        if not rows:
+            return None
+        return self.server_at_view_index(rows[0])
 
-    def start_connect(self):
-        if vpncore.is_active():
+    def on_row_activated(self, index):
+        server = self.server_at_view_index(index)
+        if server is not None:
+            self.connect_to(server)
+
+    def show_row_menu(self, pos):
+        # customContextMenuRequested reports viewport coordinates, and a right
+        # click does not move the selection, so resolve the row under the
+        # cursor rather than trusting the current selection.
+        index = self.view.indexAt(pos)
+        server = self.server_at_view_index(index)
+        if server is None:
+            return
+
+        menu = QMenu(self)
+
+        connect = menu.addAction("Connect")
+        connect.setEnabled(not self.vpn_active and not self.is_busy)
+        connect.triggered.connect(lambda: self.connect_to(server))
+
+        disconnect = menu.addAction("Disconnect")
+        disconnect.setEnabled(self.vpn_active and not self.is_busy)
+        disconnect.triggered.connect(self.start_disconnect)
+
+        menu.addSeparator()
+
+        is_fav = self.favourites.contains(server)
+        fav = menu.addAction("Remove from favourites" if is_fav else "Add to favourites")
+        fav.triggered.connect(lambda: self.toggle_favourite(index))
+
+        menu.addSeparator()
+
+        column = index.column()
+        if column != COL_FAV:
+            cell = menu.addAction(f"Copy {self.model.HEADERS[column]}")
+            cell.triggered.connect(
+                lambda: self.copy_text(self.model.display(server, column)))
+
+        copy_menu = menu.addMenu("Copy field")
+        for label, value in (
+            ("Host name", server.get("HostName", "")),
+            ("Country", server.get("CountryLong", "")),
+            ("Ping", self.model.display(server, COL_PING)),
+            ("Rating", self.model.display(server, COL_RATING)),
+            ("IP", server.get("IP", "")),
+            ("Protocol", self.model.protocol(server)),
+        ):
+            action = copy_menu.addAction(label)
+            action.triggered.connect(
+                lambda _checked=False, text=value: self.copy_text(text))
+
+        full = menu.addAction("Copy full row")
+        full.triggered.connect(lambda: self.copy_text(self.row_as_text(server)))
+
+        menu.exec(self.view.viewport().mapToGlobal(pos))
+
+    def row_as_text(self, server):
+        return "\n".join([
+            f"Host:     {server.get('HostName', '')}",
+            f"Country:  {server.get('CountryLong', '')} ({server.get('CountryShort', '')})",
+            f"IP:       {server.get('IP', '')}",
+            f"Ping:     {self.model.display(server, COL_PING)}",
+            f"Rating:   {self.model.display(server, COL_RATING)} "
+            f"(score {server.get('Score', '0')})",
+            f"Protocol: {self.model.protocol(server)}",
+            f"Sessions: {server.get('NumVpnSessions', '?')}",
+        ])
+
+    def copy_text(self, text):
+        QApplication.clipboard().setText(str(text))
+
+    def toggle_favourite(self, index):
+        server = self.server_at_view_index(index)
+        if server is None:
+            return
+        source_row = self.proxy.mapToSource(index).row()
+        self.favourites.toggle(server)
+        self.model.refresh_row(source_row)
+        self.proxy.invalidateFilter()
+
+    # -- connection ---------------------------------------------------------
+
+    def start_connect(self, *_args):
+        server = self.selected_server()
+        if server is None:
+            QMessageBox.warning(self, "Selection Required", "Please select a server.")
+            return
+        self.connect_to(server)
+
+    def connect_to(self, server):
+        if self.is_busy:
+            return
+        if self.refresh_active_state():
             QMessageBox.critical(self, "Error", "A VPN is already running.")
             self.update_ui_state()
             return
 
-        row = self.table.currentRow()
-        if row < 0:
-            QMessageBox.warning(self, "Selection Required", "Please select a server.")
-            return
-            
-        server = self.filtered_servers[row]
-        proto = "tcp" if self.radio_tcp.isChecked() else None
+        checked = self.proto_group.checkedAction()
+        proto = "tcp" if checked is not None and checked.data() == "tcp" else None
         self.status_label.setText(f"Status: Connecting to {server['IP']} (10s timeout)...")
         self.update_ui_state(is_busy=True)
         self.worker = Worker("connect", server, proto)
         self.worker.finished.connect(self.on_action_finished)
         self.worker.start()
 
-    def start_disconnect(self):
+    def start_disconnect(self, *_args):
+        if self.is_busy:
+            return
         self.status_label.setText("Status: Disconnecting...")
         self.update_ui_state(is_busy=True)
         self.worker = Worker("disconnect")
@@ -366,45 +955,24 @@ class VPNWindow(QMainWindow):
         self.worker.start()
 
     def on_action_finished(self, success, message):
-        self.status_label.setText(f"Status: {message}")
         self.is_busy = False
+        self.refresh_active_state()
         if not success:
             QMessageBox.critical(self, "VPN Error", message)
         self.update_ui_state()
 
-def set_dark_theme(app):
-    app.setStyle("Fusion")
-    palette = QPalette()
-    palette.setColor(QPalette.ColorRole.Window, QColor(30, 30, 30))
-    palette.setColor(QPalette.ColorRole.WindowText, QColor(236, 240, 241))
-    palette.setColor(QPalette.ColorRole.Base, QColor(45, 45, 45))
-    palette.setColor(QPalette.ColorRole.AlternateBase, QColor(30, 30, 30))
-    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(236, 240, 241))
-    palette.setColor(QPalette.ColorRole.ToolTipText, QColor(30, 30, 30))
-    palette.setColor(QPalette.ColorRole.Text, QColor(236, 240, 241))
-    palette.setColor(QPalette.ColorRole.Button, QColor(45, 45, 45))
-    palette.setColor(QPalette.ColorRole.ButtonText, QColor(236, 240, 241))
-    palette.setColor(QPalette.ColorRole.BrightText, QColor(231, 76, 60))
-    palette.setColor(QPalette.ColorRole.Link, QColor(52, 152, 219))
-    palette.setColor(QPalette.ColorRole.Highlight, QColor(52, 152, 219))
-    palette.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
-    
-    # Disabled state colors
-    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(127, 127, 127))
-    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor(127, 127, 127))
-    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor(127, 127, 127))
-    
-    app.setPalette(palette)
 
 if __name__ == "__main__":
-    os.environ["QT_QPA_PLATFORM"] = "wayland;xcb"
+    # Respect an explicit platform choice (offscreen testing, forced xcb) and
+    # only fall back to the Wayland-then-X11 default.
+    os.environ.setdefault("QT_QPA_PLATFORM", "wayland;xcb")
+
     app = QApplication(sys.argv)
-    set_dark_theme(app)
-    
-    # Add this line so Wayland knows which .desktop file to associate with this process
-    app.setDesktopFileName("vpngate-gui") 
-    
+    # No style or palette is forced here: Qt picks up the system theme.
+    app.setDesktopFileName("vpngate-gui")
+    app.setApplicationName("VPN Gate Client")
     app.setQuitOnLastWindowClosed(False)
+
     window = VPNWindow()
     window.show()
     sys.exit(app.exec())

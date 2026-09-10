@@ -51,6 +51,32 @@ Launch the graphical interface:
 vpngate-gui               # once installed
 ```
 
+The window follows your system Qt theme. Closing it hides to the tray;
+**Ctrl+Q** actually quits, tearing down the VPN on the way out.
+
+**Search.** The box above the list takes GitHub-style qualifiers, which combine:
+
+| Qualifier | Matches |
+|---|---|
+| `@host:public-vpn-78` | host name |
+| `@country:FR` | country code or full name |
+| `@ip:219.100` | IP address |
+| `@proto:udp` | exact protocol |
+| `@ping:<100` | ping below a value — also `>50`, or a bare `40` meaning at most 40 |
+| `@rating:good` | rating label |
+| `@favorite` `@udp` `@tcp` | bare flags |
+
+Anything else is free text, matched against country, IP and host name. So
+`@country:JP @udp @ping:<50` narrows to fast Japanese UDP servers.
+
+**Right-click a row** for Connect, Disconnect, favourite toggle, copy the
+clicked cell, copy any single field, or copy the whole row. **Double-click**
+connects. Favourites are marked ★ and persist to
+`~/.config/vpn-gate-client/favourites.json`.
+
+**Shortcuts:** `Ctrl+R` refresh, `Ctrl+F` search, `Ctrl+K` connect,
+`Ctrl+D` disconnect, `Ctrl+Q` quit.
+
 ### 2. CLI Mode
 Connect to a VPN using the command line:
 ```bash
