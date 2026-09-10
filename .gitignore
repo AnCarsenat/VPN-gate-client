@@ -7,3 +7,6 @@ __pycache__/
 /src/vpn-gate-client/
 *.pkg.tar.zst
 *.tar.gz
+
+# Raw full-desktop screenshots; only the cropped ones in images/ are committed
+/images/raw/
