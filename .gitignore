@@ -2,9 +2,11 @@ __pycache__/
 *.py[cod]
 
 # makepkg artifacts if it is ever run from the repo root (it should not be:
-# $srcdir is ./src, which collides with the source tree)
+# $srcdir is ./src, which collides with the source tree, and SRCDEST is the
+# PKGBUILD directory, so the bare clone lands beside it)
 /pkg/
 /src/vpn-gate-client/
+/vpn-gate-client/
 *.pkg.tar.zst
 *.tar.gz
 

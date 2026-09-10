@@ -1,6 +1,6 @@
 # Maintainer: Meepaw <git@github.com:Me3paw/VPN-gate-CLI.git>
 pkgname=vpn-gate-client
-pkgver=1.1.1
+pkgver=1.2.0
 pkgrel=1
 pkgdesc="A lightweight CLI and GUI for VPN Gate using NetworkManager with legacy OpenSSL support"
 arch=('any')

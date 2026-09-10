@@ -211,6 +211,7 @@ src/assets/requirements.txt     Python dependencies
 src/assets/vpngate-gui.desktop  Desktop entry
 images/                         README screenshots
 PKGBUILD, .SRCINFO              Arch packaging
+build-local.sh                  Build the package from your working tree
 ```
 
 Two rules keep this working:
@@ -267,31 +268,44 @@ app dies silently, that is almost always why — run it under
 
 ### Testing the package
 
-`makepkg` builds from the **git tag on GitHub**, so it will not see your local
-edits. To test packaging changes, build from your working clone instead:
-
-> **Do not run `makepkg` in the repo root.** Its `$srcdir` is `./src`, which is
-> where this project's source lives — it would clone into and clutter your
-> source tree. Always build from a scratch directory.
+Use the helper:
 
 ```bash
-mkdir -p /tmp/pkgtest && cd /tmp/pkgtest
-sed -e "s|^source=.*|source=(\"\${pkgname}::git+file:///path/to/your/VPN-gate-client\")|" \
-    -e '/#tag=/d' /path/to/your/VPN-gate-client/PKGBUILD > PKGBUILD
-makepkg -f
-tar tf *.pkg.tar.zst        # check the installed layout
+./build-local.sh
 ```
 
-`git+file://` clones **committed** state only, so commit before each run.
-
-Then install it for real and exercise the entry points:
+It prints the installed layout and the path to the `.pkg.tar.zst`, then:
 
 ```bash
-sudo pacman -U *.pkg.tar.zst
+sudo pacman -U vpn-gate-client-*.pkg.tar.zst
 vpngate --status
 vpngate-gui
 sudo pacman -R vpn-gate-client
 ```
+
+**Why not just run `makepkg`?** Two reasons, both of which bite:
+
+- The committed `PKGBUILD` fetches `#tag=v${pkgver}` from GitHub, so a plain
+  `makepkg` builds **whatever that tag holds** — not your working tree. If the
+  tag predates a change to the layout, `package()` fails on a path that exists
+  perfectly well in your clone:
+
+  ```
+  install: cannot stat 'src/vpngate-cli.py': No such file or directory
+  ==> ERROR: A failure occurred in package().
+  ```
+
+  That is the tag being stale, not the PKGBUILD being wrong.
+
+- **Never run `makepkg` in the repo root.** Its `$srcdir` is `./src`, which is
+  where this project's source lives, and `SRCDEST` defaults to the PKGBUILD
+  directory — so it drops a bare clone next to your files and a checkout of the
+  released tag *inside* `src/`. Both are gitignored, but it is confusing.
+
+`build-local.sh` avoids both: it rewrites `source=` to a `git+file://` URL
+pointing at your clone and builds in a scratch directory. `git+file://` clones
+**committed** state only, so commit before each run — the script warns if you
+have not.
 
 Run `namcap PKGBUILD *.pkg.tar.zst` (from the `namcap` package) to catch missing
 dependencies and bad paths.
