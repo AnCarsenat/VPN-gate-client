@@ -332,11 +332,17 @@ class ServerModel(QAbstractTableModel):
         if col == COL_RATING:
             return server_score(server)
         if col == COL_IP:
-            # Sort dotted quads numerically rather than lexically.
+            # Sort dotted quads numerically rather than lexically. Zero-padded
+            # octets, not a packed integer: anything above 127.x.x.x exceeds
+            # the 32-bit int a QVariant carries and wraps negative, and a tuple
+            # does not survive the round trip at all.
+            parts = server.get("IP", "").split(".")
+            if len(parts) != 4:
+                return ""
             try:
-                return tuple(int(part) for part in server.get("IP", "").split("."))
+                return "".join(f"{int(part):03d}" for part in parts)
             except ValueError:
-                return (0, 0, 0, 0)
+                return ""
         if col == COL_PROTO:
             return self.protocol(server)
         return ""
@@ -387,9 +393,24 @@ class ServerModel(QAbstractTableModel):
 # ---------------------------------------------------------------------------
 
 QUALIFIER_RE = re.compile(
-    r"@?(host|country|ip|proto|protocol|rating|ping)\s*:\s*(\S+)", re.IGNORECASE)
-FLAG_RE = re.compile(r"@(favorite|favourite|fav|udp|tcp)\b", re.IGNORECASE)
+    r"@?(host|country|ip|proto|protocol|rating|ping|sort)\s*:\s*(\S+)", re.IGNORECASE)
+# Longest first: "sort-desc\b" would not match inside "sort-descending", but
+# keeping them ordered makes the intent obvious.
+FLAG_RE = re.compile(
+    r"@(sort-descending|sort-desc|descending|desc|favorite|favourite|fav|udp|tcp)\b",
+    re.IGNORECASE)
 FAVOURITE_FLAGS = {"favorite", "favourite", "fav"}
+DESCENDING_FLAGS = {"sort-descending", "sort-desc", "descending", "desc"}
+
+# What @sort: accepts, mapped to a column.
+SORT_COLUMNS = {
+    "favorite": COL_FAV, "favourite": COL_FAV, "fav": COL_FAV, "star": COL_FAV,
+    "country": COL_COUNTRY, "flag": COL_COUNTRY,
+    "ping": COL_PING, "latency": COL_PING,
+    "rating": COL_RATING, "score": COL_RATING,
+    "ip": COL_IP, "address": COL_IP,
+    "proto": COL_PROTO, "protocol": COL_PROTO,
+}
 
 
 class ServerFilterProxy(QSortFilterProxyModel):
@@ -406,16 +427,41 @@ class ServerFilterProxy(QSortFilterProxyModel):
         self._qualifiers = []
         self._flags = set()
         self._free_text = ""
+        # (column, order) asked for by @sort in the query, or None. The window
+        # applies it; the proxy only parses it.
+        self.sort_request = None
         self.setSortRole(Qt.ItemDataRole.UserRole)
 
     def set_query(self, text):
         text = text or ""
-        self._qualifiers = [(key.lower(), value.lower())
-                            for key, value in QUALIFIER_RE.findall(text)]
+        qualifiers = [(key.lower(), value.lower())
+                      for key, value in QUALIFIER_RE.findall(text)]
         self._flags = {flag.lower() for flag in FLAG_RE.findall(text)}
+
+        # @sort: steers the view rather than filtering, so keep it out of the
+        # qualifiers that rows are matched against.
+        self._qualifiers = [(key, value) for key, value in qualifiers if key != "sort"]
+        self.sort_request = self._parse_sort(qualifiers)
+
         leftover = FLAG_RE.sub(" ", QUALIFIER_RE.sub(" ", text))
         self._free_text = " ".join(leftover.split()).lower()
         self.invalidateFilter()
+
+    def _parse_sort(self, qualifiers):
+        """Resolve @sort:<column> and @sort-descending into (column, order)."""
+        descending = bool(self._flags & DESCENDING_FLAGS)
+        order = (Qt.SortOrder.DescendingOrder if descending
+                 else Qt.SortOrder.AscendingOrder)
+
+        column = None
+        for key, value in qualifiers:
+            if key == "sort":
+                column = SORT_COLUMNS.get(value)
+
+        if column is None:
+            # A bare @sort-descending flips the column already in use.
+            return (None, order) if descending else None
+        return (column, order)
 
     def filterAcceptsRow(self, source_row, source_parent):
         model = self.sourceModel()
@@ -759,7 +805,8 @@ class VPNWindow(QMainWindow):
 
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText(
-            "Search  —  @country:FR   @host:public-vpn   @favorite   @udp   @ping:<100")
+            "Search  —  @country:FR   @favorite   @ping:<100   "
+            "@sort:ping   @sort-descending")
         self.search_box.setClearButtonEnabled(True)
         self.search_box.textChanged.connect(self.on_search_changed)
         layout.addWidget(self.search_box)
@@ -996,6 +1043,7 @@ class VPNWindow(QMainWindow):
 
     def on_search_changed(self, text):
         self.proxy.set_query(text)
+        self.apply_sort_request()
         # Keep the menu checkbox in step with a hand-typed @favorite.
         has_flag = bool(FLAG_RE.search(text) and
                         FAVOURITE_FLAGS & {m.lower() for m in FLAG_RE.findall(text)})
@@ -1003,6 +1051,19 @@ class VPNWindow(QMainWindow):
             self.act_favourites_only.blockSignals(True)
             self.act_favourites_only.setChecked(has_flag)
             self.act_favourites_only.blockSignals(False)
+
+    def apply_sort_request(self):
+        """Apply @sort / @sort-descending from the query to the header."""
+        request = self.proxy.sort_request
+        if request is None:
+            return
+        column, order = request
+        if column is None:
+            # Bare @sort-descending: keep the column, change the direction.
+            column = self.view.horizontalHeader().sortIndicatorSection()
+            if column < 0:
+                column = COL_RATING
+        self.view.sortByColumn(column, order)
 
     def on_favourites_only(self, checked):
         text = self.search_box.text()
@@ -1033,10 +1094,17 @@ class VPNWindow(QMainWindow):
             "  @ping:<100             ping below a value; also >N, or a bare\n"
             "                         number meaning at most N\n"
             "  @rating:good           match the rating label\n\n"
+            "Sorting:\n"
+            "  @sort:ping             sort by a column - one of favorite,\n"
+            "                         country, ping, rating, ip, proto\n"
+            "  @sort-descending       sort the other way round; on its own it\n"
+            "                         flips the column already in use\n\n"
             "Flags:\n"
             "  @favorite    @udp    @tcp\n\n"
             "Anything else is free text, matched against country, IP and host.\n\n"
-            "Example:  @country:JP @udp @ping:<50"))
+            "Examples:\n"
+            "  @country:JP @udp @ping:<50\n"
+            "  @sort:rating @sort-descending"))
 
     # -- row actions --------------------------------------------------------
 

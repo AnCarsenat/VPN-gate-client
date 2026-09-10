@@ -82,6 +82,17 @@ The box above the list takes GitHub-style qualifiers, which combine:
 | `@rating:good` | rating label |
 | `@favorite` `@udp` `@tcp` | bare flags |
 
+Sorting is part of the same box:
+
+| Qualifier | Effect |
+|---|---|
+| `@sort:ping` | sort by a column — `favorite`, `country`, `ping`, `rating`, `ip` or `proto` |
+| `@sort-descending` | reverse the direction; on its own it flips the column already in use |
+
+`@sort:score`, `@sort:latency` and `@sort:protocol` are accepted as aliases, and
+`@sort-desc` / `@desc` are short forms. Clicking a column header still sorts as
+before.
+
 Anything else is free text, matched against country, IP and host name. So
 `@country:JP @udp @ping:<50` narrows to fast Japanese UDP servers. The `@` is
 optional and everything is case-insensitive.
