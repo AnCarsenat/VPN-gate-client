@@ -30,6 +30,10 @@ networking knowledge, so YMMV. Good luck.
 yay -S vpn-gate-client
 ```
 
+Nothing else to do — the package declares its dependencies, so pacman pulls
+`python-requests`, `python-pyqt6`, NetworkManager and the OpenVPN plugin in
+with it.
+
 ### 2. Manual
 
 ```bash
@@ -37,22 +41,28 @@ git clone https://github.com/Me3paw/vpn-gate-client.git
 cd vpn-gate-client
 ```
 
-Install the dependencies yourself. On Arch, use the system packages:
+Create a virtual environment and install the Python dependencies into it:
 
 ```bash
-sudo pacman -S python-requests python-pyqt6 networkmanager networkmanager-openvpn
-```
-
-Elsewhere, or if you prefer an isolated environment:
-
-```bash
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate
 pip install -r src/assets/requirements.txt
 ```
 
-The scripts do not install anything for you; they print the command to run if a
-dependency is missing. `python-requests` is enough for the CLI, the GUI also
-needs `python-pyqt6`.
+That is `requests` and `PyQt6` — around 280 MB, nearly all of it Qt.
+
+NetworkManager and its OpenVPN plugin are not Python packages, so they still
+have to come from your distribution:
+
+```bash
+sudo pacman -S networkmanager networkmanager-openvpn      # Arch
+sudo apt install network-manager network-manager-openvpn  # Debian/Ubuntu
+```
+
+**Keep the environment activated while you run either script.** Both start with
+`#!/usr/bin/env python3`, so they use whichever `python3` comes first on `PATH`:
+the venv's while it is activated, the system one otherwise. If you skip the
+activation they will tell you what is missing rather than failing obscurely.
 
 ## GUI
 
